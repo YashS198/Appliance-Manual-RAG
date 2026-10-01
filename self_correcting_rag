@@ -1,0 +1,298 @@
+from __future__ import annotations
+import json, re, time
+from dataclasses import dataclass, field, asdict
+from typing import Callable, List, Optional
+import numpy as np
+
+
+# --------------------------------------------------------------------------
+# Data + config
+# --------------------------------------------------------------------------
+@dataclass
+class Chunk:
+    text: str
+    score: float                      # cosine similarity to the query
+    emb: Optional[np.ndarray] = None  # normalised embedding (filled lazily)
+
+
+@dataclass
+class Config:
+    k: int = 5
+    k_prime: int = 10                 # K' > K for Insufficient Evidence
+    s_agg: str = "mean"               # "mean" or "max"
+    s_min: float = 0.35               # Low Similarity if S < s_min
+    r_min: float = 0.35               # Irrelevant Context if R < r_min
+    e_min: float = 0.60               # Insufficient Evidence if E < e_min
+    d_max: float = 0.30               # Redundant Context if D > d_max
+    dup_sim: float = 0.90             # two chunks "near-duplicate" above this
+    chunk_rel_min: float = 0.30       # per-chunk relevance cut for filtering
+    min_keep: int = 2                 # never filter below this many chunks
+    log_path: str = "recovery_log.jsonl"
+
+
+# --------------------------------------------------------------------------
+# Text helpers (no external NLP deps)
+# --------------------------------------------------------------------------
+_STOP = set("""a an the is are was were be been do does did can could should would will
+how what why when where which who whom to of in on at for from with without by and or
+if it its this that these those my your i you we they me use using get make""".split())
+
+
+def _stem(w: str) -> str:
+    for suf in ("ing", "ed", "es", "s", "ly"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            return w[: -len(suf)]
+    return w
+
+
+def key_terms(text: str) -> set:
+    toks = re.findall(r"[a-z0-9]+", text.lower())
+    return {_stem(t) for t in toks if t not in _STOP and len(t) > 1}
+
+
+def sub_questions(q: str) -> List[set]:
+    parts = re.split(r"\?|;|,|\band\b|\balso\b", q.lower())
+    subs = [key_terms(p) for p in parts]
+    subs = [s for s in subs if s]
+    return subs or [key_terms(q)]
+
+
+# --------------------------------------------------------------------------
+# Signals S, R, E, D
+# --------------------------------------------------------------------------
+def chunk_relevance(q_terms: set, c: Chunk) -> float:
+    """Per-chunk relevance: half lexical overlap, half embedding similarity."""
+    overlap = len(q_terms & key_terms(c.text)) / max(len(q_terms), 1)
+    return 0.5 * overlap + 0.5 * float(np.clip(c.score, 0, 1))
+
+
+def compute_signals(query: str, chunks: List[Chunk], cfg: Config) -> dict:
+    if not chunks:
+        return dict(S=0.0, R=0.0, E=0.0, D=0.0)
+    scores = [c.score for c in chunks]
+    S = float(np.mean(scores) if cfg.s_agg == "mean" else np.max(scores))
+
+    q_terms = key_terms(query)
+    R = float(np.mean([chunk_relevance(q_terms, c) for c in chunks]))
+
+    # E: sub-question coverage + union key-term coverage
+    chunk_terms = [key_terms(c.text) for c in chunks]
+    union = set().union(*chunk_terms)
+    term_cov = len(q_terms & union) / max(len(q_terms), 1)
+    subs = sub_questions(query)
+    covered = sum(
+        any(len(s & ct) / len(s) >= 0.5 for ct in chunk_terms) for s in subs
+    )
+    E = 0.5 * (covered / len(subs)) + 0.5 * term_cov
+
+    # D: fraction of chunks that are near-duplicates of an earlier chunk
+    D = 0.0
+    if len(chunks) > 1:
+        M = np.vstack([c.emb for c in chunks])
+        sim = M @ M.T
+        dup = sum(any(sim[i, j] > cfg.dup_sim for j in range(i)) for i in range(1, len(chunks)))
+        D = dup / len(chunks)
+    return dict(S=round(S, 4), R=round(R, 4), E=round(E, 4), D=round(D, 4))
+
+
+# --------------------------------------------------------------------------
+# Diagnosis (ordered rules) + policy
+# --------------------------------------------------------------------------
+POLICY = {
+    "Low Similarity": "query_rewrite_and_reretrieve",
+    "Irrelevant Context": "filter_and_rerank",
+    "Insufficient Evidence": "increase_topk_and_reretrieve",
+    "Redundant Context": "remove_redundancy",
+}
+
+
+def diagnose(sig: dict, cfg: Config):
+    if sig["S"] < cfg.s_min:
+        return "Low Similarity", f"S={sig['S']} < {cfg.s_min}"
+    if sig["R"] < cfg.r_min:
+        return "Irrelevant Context", f"S adequate but R={sig['R']} < {cfg.r_min}"
+    if sig["E"] < cfg.e_min:
+        return "Insufficient Evidence", f"E={sig['E']} < {cfg.e_min}"
+    if sig["D"] > cfg.d_max:
+        return "Redundant Context", f"D={sig['D']} > {cfg.d_max}"
+    return None, "all signals within thresholds"
+
+
+# --------------------------------------------------------------------------
+# Pipeline
+# --------------------------------------------------------------------------
+ANSWER_PROMPT = """You are a helpful assistant answering questions about a home appliance manual.
+Answer ONLY using the context below. If the answer is not in the context, say you could not
+find it in the manual. Be concise and give steps/warnings when relevant.
+
+Context:
+{context}
+
+Question: {query}
+Answer:"""
+
+REWRITE_PROMPT = """Rewrite the question below to improve retrieval from an appliance manual.
+Expand abbreviations, and add synonyms or terms a manual would use. Keep the SAME information
+need. Return only the rewritten query, nothing else.
+
+Question: {query}
+Rewritten:"""
+
+
+class SelfCorrectingRAG:
+    def __init__(self, retriever, llm: Callable[[str], str], cfg: Config = Config()):
+        self.ret, self.llm, self.cfg = retriever, llm, cfg
+
+    # -- helpers
+    def _retrieve(self, query: str, k: int) -> List[Chunk]:
+        chunks = self.ret.search(query, k)
+        missing = [c for c in chunks if c.emb is None]
+        if missing:
+            embs = self.ret.embed([c.text for c in missing])
+            for c, e in zip(missing, embs):
+                c.emb = e
+        return chunks
+
+    def _generate(self, query: str, chunks: List[Chunk]) -> str:
+        ctx = "\n\n".join(f"[{i+1}] {c.text}" for i, c in enumerate(chunks))
+        return self.llm(ANSWER_PROMPT.format(context=ctx, query=query))
+
+    # -- recovery actions
+    def _rewrite_query(self, query: str) -> str:
+        out = self.llm(REWRITE_PROMPT.format(query=query)).strip().strip('"')
+        return out.splitlines()[0] if out else query
+
+    def _filter_and_rerank(self, query: str, chunks: List[Chunk]) -> List[Chunk]:
+        qt = key_terms(query)
+        scored = sorted(((chunk_relevance(qt, c), c) for c in chunks), key=lambda x: -x[0])
+        kept = [c for r, c in scored if r >= self.cfg.chunk_rel_min]
+        if len(kept) < self.cfg.min_keep:
+            kept = [c for _, c in scored[: self.cfg.min_keep]]
+        return kept
+
+    def _remove_redundancy(self, chunks: List[Chunk]) -> List[Chunk]:
+        kept: List[Chunk] = []
+        for c in chunks:  # chunks arrive ranked, so the best copy is kept
+            if all(float(c.emb @ k.emb) <= self.cfg.dup_sim for k in kept):
+                kept.append(c)
+        return kept
+
+    # -- main entry
+    def run(self, query: str) -> dict:
+        cfg, t0 = self.cfg, time.time()
+        chunks = self._retrieve(query, cfg.k)
+        sig_before = compute_signals(query, chunks, cfg)
+        failure, reason = diagnose(sig_before, cfg)
+
+        final_chunks, action, used_query, outcome = chunks, None, query, "n/a"
+        status = "resolved_directly"
+        sig_after = sig_before
+        extra_calls = 0
+
+        if failure:
+            action = POLICY[failure]
+            if failure == "Low Similarity":
+                used_query = self._rewrite_query(query)
+                new = self._retrieve(used_query, cfg.k)
+                extra_calls = 2  # rewrite LLM call + retrieval
+            elif failure == "Insufficient Evidence":
+                new = self._retrieve(query, cfg.k_prime)
+                extra_calls = 1
+            elif failure == "Irrelevant Context":
+                new = self._filter_and_rerank(query, chunks)
+            else:
+                new = self._remove_redundancy(chunks)
+
+            # evaluate against the ORIGINAL query so signals are comparable
+            sig_after = compute_signals(query, new, cfg)
+            still_failing, _ = diagnose(sig_after, cfg)
+            improved = self._improved(failure, sig_before, sig_after)
+
+            if improved:
+                final_chunks = new
+                status = "resolved_via_recovery" if not still_failing else "partially_recovered"
+                outcome = "improved" if not still_failing else "improved_but_still_flagged"
+            else:
+                outcome = "no_improvement_kept_original"
+                status = "unresolved"
+                used_query = query
+
+        answer = self._generate(query, final_chunks)
+        entry = dict(
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            query=query,
+            rewritten_query=used_query if used_query != query else None,
+            retrieval_k=cfg.k,
+            signals_before=sig_before,
+            diagnosed_failure=failure,
+            reason=reason,
+            recovery_action=action,
+            signals_after=sig_after if failure else None,
+            recovery_outcome=outcome,
+            final_status=status,
+            n_chunks_used=len(final_chunks),
+            extra_calls=extra_calls,
+            latency_s=round(time.time() - t0, 3),
+            answer=answer,
+        )
+        with open(cfg.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        entry["context"] = [c.text for c in final_chunks]
+        return entry
+
+    @staticmethod
+    def _improved(failure: str, b: dict, a: dict) -> bool:
+        key = {"Low Similarity": "S", "Irrelevant Context": "R",
+               "Insufficient Evidence": "E"}.get(failure)
+        if key:
+            return a[key] > b[key]
+        return a["D"] < b["D"]  # redundancy
+
+    def baseline(self, query: str) -> str:
+        """Plain RAG (no diagnosis/recovery/logging) for comparison."""
+        return self._generate(query, self._retrieve(query, self.cfg.k))
+
+
+# --------------------------------------------------------------------------
+# Reference retriever: SBERT + FAISS (replace with your own if you like)
+# --------------------------------------------------------------------------
+class SBertFaissRetriever:
+    def __init__(self, texts: List[str], model_name="all-MiniLM-L6-v2"):
+        import faiss
+        from sentence_transformers import SentenceTransformer
+        self.texts = texts
+        self.model = SentenceTransformer(model_name)
+        self.embs = self.embed(texts)
+        self.index = faiss.IndexFlatIP(self.embs.shape[1])  # cosine on normalised vectors
+        self.index.add(self.embs)
+
+    def embed(self, texts: List[str]) -> np.ndarray:
+        return np.asarray(
+            self.model.encode(texts, normalize_embeddings=True), dtype="float32"
+        )
+
+    def search(self, query: str, k: int) -> List[Chunk]:
+        q = self.embed([query])
+        scores, ids = self.index.search(q, min(k, len(self.texts)))
+        return [Chunk(self.texts[i], float(s), self.embs[i]) for s, i in zip(scores[0], ids[0]) if i >= 0]
+
+
+# --------------------------------------------------------------------------
+# Demo wiring: replace chunks + llm with your existing ones
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    chunks = [...]  # <- your manual chunks (list[str]) from your preprocessing step
+
+    def llm(prompt: str) -> str:
+        raise NotImplementedError("call your LLM here and return its text")
+
+    rag = SelfCorrectingRAG(SBertFaissRetriever(chunks), llm)
+    while True:
+        q = input("\nQuery (blank to quit): ").strip()
+        if not q:
+            break
+        r = rag.run(q)
+        print(f"\nFailure : {r['diagnosed_failure']} ({r['reason']})")
+        print(f"Action  : {r['recovery_action']} -> {r['recovery_outcome']}")
+        print(f"Signals : {r['signals_before']} -> {r['signals_after']}")
+        print(f"\nAnswer:\n{r['answer']}")
