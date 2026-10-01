@@ -281,7 +281,7 @@ class SBertFaissRetriever:
 # Demo wiring: replace chunks + llm with your existing ones
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
-    chunks = [...]  # <- your manual chunks (list[str]) from your preprocessing step
+    chunks = [input_manual]  
 
     def llm(prompt: str) -> str:
         raise NotImplementedError("call your LLM here and return its text")
